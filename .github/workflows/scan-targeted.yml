@@ -23,9 +23,9 @@ jobs:
           DEV: CPU
         run: |
           python - <<'PY'
-          import time
+          import statistics, time
           import numpy as np
-          from tinygrad import Tensor, associative_scan, GlobalCounters
+          from tinygrad import Tensor, TinyJit, associative_scan, Device, GlobalCounters
 
           batch, width, length, state = 1, 8, 128, 8
           rng = np.random.default_rng(0)
@@ -43,14 +43,14 @@ jobs:
             right_a, right_b = right
             return right_a*left_a, right_a*left_b+right_b
 
-          def serial():
+          def serial(a, b):
             carry, outputs = Tensor.zeros(batch, width, state), []
             for i in range(length):
               carry = a[:, :, i]*carry+b[:, :, i]
               outputs.append(carry)
-            return Tensor.stack(*outputs, dim=2)
+            return Tensor.stack(*outputs, dim=2).realize()
 
-          def hillis_steele():
+          def hillis_steele(a, b):
             out_a, out_b, stride = a, b, 1
             while stride < length:
               merged_a, merged_b = compose((out_a[:, :, :-stride], out_b[:, :, :-stride]),
@@ -58,16 +58,31 @@ jobs:
               out_a = out_a[:, :, :stride].cat(merged_a, dim=2).contiguous()
               out_b = out_b[:, :, :stride].cat(merged_b, dim=2).contiguous()
               stride *= 2
-            return out_b
+            return out_b.realize()
 
-          def blocked():
-            return associative_scan(compose, (a, b), axis=2)[1]
+          def blocked(a, b):
+            return associative_scan(compose, (a, b), axis=2)[1].realize()
 
           for name, fn in (("serial", serial), ("hillis_steele", hillis_steele), ("blocked", blocked)):
             GlobalCounters.reset()
             start = time.perf_counter()
-            out = fn().realize()
+            out = fn(a, b)
+            Device[Device.DEFAULT].synchronize()
             elapsed = time.perf_counter()-start
             np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5, atol=1e-6)
-            print(f"SCAN_BENCH name={name} seconds={elapsed:.6f} kernels={GlobalCounters.kernel_count}")
+            print(f"SCAN_BUILD name={name} seconds={elapsed:.6f} kernels={GlobalCounters.kernel_count}")
+
+            jit = TinyJit(fn)
+            jit(a, b); jit(a, b)
+            Device[Device.DEFAULT].synchronize()
+            samples = []
+            GlobalCounters.reset()
+            for _ in range(20):
+              start = time.perf_counter()
+              out = jit(a, b)
+              Device[Device.DEFAULT].synchronize()
+              samples.append(time.perf_counter()-start)
+            np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5, atol=1e-6)
+            print(f"SCAN_REPLAY name={name} median_ms={statistics.median(samples)*1e3:.6f} "
+                  f"kernels_per_call={GlobalCounters.kernel_count/len(samples):.1f} device_ms={GlobalCounters.time_sum_s/len(samples)*1e3:.6f}")
           PY
