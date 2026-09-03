@@ -45,11 +45,24 @@ def associative_scan(combine_fn:Callable[[Any, Any], Any], elems:Any, axis:int=0
 
   def update(x:Tensor, value:Tensor, start:int, stop:int, step:int) -> Tensor:
     a = x._resolve_dim(axis)
-    idx = (slice(None),)*a + (slice(start, stop, step),)
-    target = x[idx]
+    target = scan_slice(x, start, stop, step)
     if value.shape != target.shape or value.dtype != x.dtype or value.device != x.device:
       raise ValueError("combine_fn must preserve the input tree structure and Tensor metadata")
-    return x._getitem(idx, value).contiguous()
+
+    # Interleave stepped updates with padding, then place that span back in the full tensor.
+    # This avoids advanced indexing and works for one-element tails at arbitrary scan lengths.
+    if step != 1 and stop-start > 1:
+      value = value.unsqueeze(a+1)
+      value = value.pad_to(tuple(step if j == a+1 else None for j in range(value.ndim)))
+      value = value.reshape(value.shape[:a] + (value.shape[a]*value.shape[a+1],) + value.shape[a+2:])
+      value = value.shrink_to(tuple(stop-start if j == a else None for j in range(value.ndim)))
+    pads = [(0, 0)] * x.ndim
+    pads[a] = (start, n-stop)
+    value = value.pad(tuple(pads))
+
+    idx = type(x).arange(n).reshape((1,)*a + (n,) + (1,)*(x.ndim-a-1))
+    mask = (idx >= start) & (idx < stop) & ((idx-start) % step == 0)
+    return mask.where(value, x).contiguous()
 
   out = _tree_map(lambda x: x.flip(x._resolve_dim(axis)) if reverse else x, elems)
   stride = 1
