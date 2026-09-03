@@ -1,13 +1,17 @@
-name: Targeted scan validation
+name: Tune hierarchical scan
 
 on:
   push:
-    branches: [bounty-3039-blocked-ci]
+    branches: [bounty-3039-tune-ci]
 
 jobs:
-  scan:
+  tune:
+    strategy:
+      fail-fast: false
+      matrix:
+        block: [4, 8, 16]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,73 +20,69 @@ jobs:
         with:
           python-version: '3.13'
           pydeps: numpy
-      - name: Run focused tests
-        run: python test/test_associative_scan.py
-      - name: Compare scan constructions
+      - name: Select block size
+        run: sed -i 's/block = 8/block = ${{ matrix.block }}/' tinygrad/scan.py
+      - name: Benchmark warmed replay
         env:
           DEV: CPU
+          BLOCK: ${{ matrix.block }}
         run: |
           python - <<'PY'
-          import statistics, time
+          import os, statistics, time
           import numpy as np
           from tinygrad import Tensor, TinyJit, associative_scan, Device, GlobalCounters
 
-          batch, width, length, state = 1, 8, 128, 8
+          block = int(os.environ["BLOCK"])
           rng = np.random.default_rng(0)
-          a_np = rng.uniform(0.7, 0.99, (batch, width, length, state)).astype(np.float32)
-          b_np = rng.uniform(-0.1, 0.1, (batch, width, length, state)).astype(np.float32)
-          a, b = Tensor(a_np).realize(), Tensor(b_np).realize()
-
-          expected, carry = np.empty_like(b_np), np.zeros_like(b_np[:, :, 0])
-          for i in range(length):
-            carry = a_np[:, :, i] * carry + b_np[:, :, i]
-            expected[:, :, i] = carry
 
           def compose(left, right):
             left_a, left_b = left
             right_a, right_b = right
             return right_a*left_a, right_a*left_b+right_b
 
-          def serial(a, b):
-            carry, outputs = Tensor.zeros(batch, width, state), []
+          for length, width, state in ((64, 8, 8), (128, 8, 8), (256, 8, 8), (128, 64, 16)):
+            shape = (1, width, length, state)
+            a_np = rng.uniform(0.7, 0.99, shape).astype(np.float32)
+            b_np = rng.uniform(-0.1, 0.1, shape).astype(np.float32)
+            a, b = Tensor(a_np).realize(), Tensor(b_np).realize()
+
+            expected, carry = np.empty_like(b_np), np.zeros_like(b_np[:, :, 0])
             for i in range(length):
-              carry = a[:, :, i]*carry+b[:, :, i]
-              outputs.append(carry)
-            return Tensor.stack(*outputs, dim=2).realize()
+              carry = a_np[:, :, i] * carry + b_np[:, :, i]
+              expected[:, :, i] = carry
 
-          def hillis_steele(a, b):
-            out_a, out_b, stride = a, b, 1
-            while stride < length:
-              merged_a, merged_b = compose((out_a[:, :, :-stride], out_b[:, :, :-stride]),
-                                            (out_a[:, :, stride:], out_b[:, :, stride:]))
-              out_a = out_a[:, :, :stride].cat(merged_a, dim=2).contiguous()
-              out_b = out_b[:, :, :stride].cat(merged_b, dim=2).contiguous()
-              stride *= 2
-            return out_b.realize()
+            def serial(a, b):
+              carry, outputs = Tensor.zeros(1, width, state), []
+              for i in range(length):
+                carry = a[:, :, i]*carry+b[:, :, i]
+                outputs.append(carry)
+              return Tensor.stack(*outputs, dim=2).realize()
 
-          def blocked(a, b):
-            return associative_scan(compose, (a, b), axis=2)[1].realize()
+            def hillis_steele(a, b):
+              out_a, out_b, stride = a, b, 1
+              while stride < length:
+                merged_a, merged_b = compose((out_a[:, :, :-stride], out_b[:, :, :-stride]),
+                                              (out_a[:, :, stride:], out_b[:, :, stride:]))
+                out_a = out_a[:, :, :stride].cat(merged_a, dim=2).contiguous()
+                out_b = out_b[:, :, :stride].cat(merged_b, dim=2).contiguous()
+                stride *= 2
+              return out_b.realize()
 
-          for name, fn in (("serial", serial), ("hillis_steele", hillis_steele), ("blocked", blocked)):
-            GlobalCounters.reset()
-            start = time.perf_counter()
-            out = fn(a, b)
-            Device[Device.DEFAULT].synchronize()
-            elapsed = time.perf_counter()-start
-            np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5, atol=1e-6)
-            print(f"SCAN_BUILD name={name} seconds={elapsed:.6f} kernels={GlobalCounters.kernel_count}")
+            def blocked(a, b):
+              return associative_scan(compose, (a, b), axis=2)[1].realize()
 
-            jit = TinyJit(fn)
-            jit(a, b); jit(a, b)
-            Device[Device.DEFAULT].synchronize()
-            samples = []
-            GlobalCounters.reset()
-            for _ in range(20):
-              start = time.perf_counter()
-              out = jit(a, b)
+            for name, fn in (("serial", serial), ("hillis_steele", hillis_steele), ("blocked", blocked)):
+              jit = TinyJit(fn)
+              jit(a, b); jit(a, b); jit(a, b)
               Device[Device.DEFAULT].synchronize()
-              samples.append(time.perf_counter()-start)
-            np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5, atol=1e-6)
-            print(f"SCAN_REPLAY name={name} median_ms={statistics.median(samples)*1e3:.6f} "
-                  f"kernels_per_call={GlobalCounters.kernel_count/len(samples):.1f} device_ms={GlobalCounters.time_sum_s/len(samples)*1e3:.6f}")
+              samples = []
+              GlobalCounters.reset()
+              for _ in range(30):
+                start = time.perf_counter()
+                out = jit(a, b)
+                Device[Device.DEFAULT].synchronize()
+                samples.append(time.perf_counter()-start)
+              np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5, atol=1e-6)
+              print(f"SCAN_TUNE block={block} length={length} width={width} state={state} name={name} "
+                    f"median_ms={statistics.median(samples)*1e3:.6f} kernels={GlobalCounters.kernel_count/len(samples):.2f}")
           PY
