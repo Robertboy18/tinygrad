@@ -62,7 +62,7 @@ def associative_scan(combine_fn:Callable[[Any, Any], Any], elems:Any, axis:int=0
 
     idx = type(x).arange(n).reshape((1,)*a + (n,) + (1,)*(x.ndim-a-1))
     mask = (idx >= start) & (idx < stop) & ((idx-start) % step == 0)
-    return mask.where(value, x).contiguous()
+    return mask.where(value, x)
 
   out = _tree_map(lambda x: x.flip(x._resolve_dim(axis)) if reverse else x, elems)
   stride = 1
