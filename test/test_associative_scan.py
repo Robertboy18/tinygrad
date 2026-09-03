@@ -6,7 +6,7 @@ from tinygrad import Tensor, associative_scan, dtypes
 
 class TestAssociativeScan(unittest.TestCase):
   def test_add_lengths(self):
-    for n in (0, 1, 2, 3, 5, 8, 17):
+    for n in (0, 1, 2, 3, 5, 8, 9, 17, 31, 32, 33):
       values = np.arange(n, dtype=np.float32)
       np.testing.assert_allclose(associative_scan(lambda a,b: a+b, Tensor(values)).numpy(), np.cumsum(values))
 
@@ -63,14 +63,14 @@ class TestAssociativeScan(unittest.TestCase):
     grad = associative_scan(lambda a,b: a+b, x).sum().gradient(x)[0]
     np.testing.assert_allclose(grad.numpy(), np.arange(7, 0, -1, dtype=np.float32))
 
-  def test_linear_combine_work(self):
+  def test_bounded_combine_work(self):
     work = []
     def combine(a, b):
-      work.append(a.shape[0])
+      work.append(a.numel())
       return a+b
     associative_scan(combine, Tensor.arange(128))
-    self.assertEqual((len(work), sum(work)), (13, 247))
-    self.assertLess(sum(work), 2*128)
+    self.assertEqual((len(work), sum(work)), (9, 435))
+    self.assertLess(sum(work), 4*128)
 
   def test_metadata_and_tree_errors(self):
     with self.assertRaises(ValueError):
