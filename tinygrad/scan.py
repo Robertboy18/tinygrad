@@ -24,8 +24,9 @@ def _tree_map(fn:Callable[..., Any], *trees:Any) -> Any:
 def associative_scan(combine_fn:Callable[[Any, Any], Any], elems:Any, axis:int=0, reverse:bool=False) -> Any:
   """Inclusive parallel scan of a Tensor tree using an associative binary function.
 
-  Uses a work-efficient Brent-Kung network: fewer than ``2*n`` elements pass through
-  ``combine_fn`` for scan length ``n``, with logarithmic dependency depth.
+  The scan is recursively blocked. Each small block is fused into one lazy graph,
+  while block prefixes are scanned hierarchically. This keeps logarithmic depth
+  without launching one kernel for every prefix-network level.
   """
   if not callable(combine_fn): raise TypeError("combine_fn must be callable")
   leaves:list[Tensor] = []
@@ -39,46 +40,57 @@ def associative_scan(combine_fn:Callable[[Any, Any], Any], elems:Any, axis:int=0
   if any(size != n for size in sizes[1:]): raise ValueError(f"associative_scan inputs must have the same scan length, got {sizes}")
   if n <= 1: return elems
 
-  def scan_slice(x:Tensor, start:int, stop:int, step:int) -> Tensor:
+  def move_front(x:Tensor) -> Tensor:
     a = x._resolve_dim(axis)
-    return x[(slice(None),)*a + (slice(start, stop, step),)]
+    return x if a == 0 else x.permute((a,)+tuple(i for i in range(x.ndim) if i != a))
 
-  def update(x:Tensor, value:Tensor, start:int, stop:int, step:int) -> Tensor:
-    a = x._resolve_dim(axis)
-    target = scan_slice(x, start, stop, step)
-    if value.shape != target.shape or value.dtype != x.dtype or value.device != x.device:
-      raise ValueError("combine_fn must preserve the input tree structure and Tensor metadata")
+  def move_back(x:Tensor, original:Tensor) -> Tensor:
+    a = original._resolve_dim(axis)
+    return x if a == 0 else x.permute(tuple(range(1, a+1))+(0,)+tuple(range(a+1, x.ndim)))
 
-    # Interleave stepped updates with padding, then place that span back in the full tensor.
-    # This avoids advanced indexing and works for one-element tails at arbitrary scan lengths.
-    if step != 1 and stop-start > 1:
-      value = value.unsqueeze(a+1)
-      value = value.pad_to(tuple(step if j == a+1 else None for j in range(value.ndim)))
-      value = value.reshape(value.shape[:a] + (value.shape[a]*value.shape[a+1],) + value.shape[a+2:])
-      value = value.shrink_to(tuple(stop-start if j == a else None for j in range(value.ndim)))
-    pads = [(0, 0)] * x.ndim
-    pads[a] = (start, n-stop)
-    value = value.pad(tuple(pads))
+  def slice_tree(tree:Any, start:int, stop:int, dim:int) -> Any:
+    return _tree_map(lambda x: x[(slice(None),)*dim + (slice(start, stop),)], tree)
 
-    idx = type(x).arange(n).reshape((1,)*a + (n,) + (1,)*(x.ndim-a-1))
-    mask = (idx >= start) & (idx < stop) & ((idx-start) % step == 0)
-    return mask.where(value, x).contiguous()
+  def checked_combine(left:Any, right:Any) -> Any:
+    result = combine_fn(left, right)
+    def check(value:Tensor, expected:Tensor) -> Tensor:
+      if value.shape != expected.shape or value.dtype != expected.dtype or value.device != expected.device:
+        raise ValueError("combine_fn must preserve the input tree structure and Tensor metadata")
+      return value
+    return _tree_map(check, result, right)
 
-  out = _tree_map(lambda x: x.flip(x._resolve_dim(axis)) if reverse else x, elems)
-  stride = 1
-  while stride < n:
-    if 2*stride-1 < n:
-      left = _tree_map(lambda x: scan_slice(x, stride-1, n-stride, 2*stride), out)
-      right = _tree_map(lambda x: scan_slice(x, 2*stride-1, n, 2*stride), out)
-      out = _tree_map(lambda x,y: update(x, y, 2*stride-1, n, 2*stride), out, combine_fn(left, right))
-    stride *= 2
+  def fused_hillis_steele(tree:Any, size:int, dim:int) -> Any:
+    out, stride = tree, 1
+    while stride < size:
+      merged = checked_combine(slice_tree(out, 0, size-stride, dim), slice_tree(out, stride, size, dim))
+      out = _tree_map(lambda x,y: x.cat(y, dim=dim), slice_tree(out, 0, stride, dim), merged)
+      stride *= 2
+    return out
 
-  stride //= 4
-  while stride:
-    if 3*stride-1 < n:
-      left = _tree_map(lambda x: scan_slice(x, 2*stride-1, n-stride, 2*stride), out)
-      right = _tree_map(lambda x: scan_slice(x, 3*stride-1, n, 2*stride), out)
-      out = _tree_map(lambda x,y: update(x, y, 3*stride-1, n, 2*stride), out, combine_fn(left, right))
-    stride //= 2
+  block = 8
+  def recursive_scan(tree:Any, size:int) -> Any:
+    if size <= block: return fused_hillis_steele(tree, size, 0)
 
-  return _tree_map(lambda x: x.flip(x._resolve_dim(axis)) if reverse else x, out)
+    blocks = (size + block - 1) // block
+    padded_size = blocks * block
+    if padded_size != size:
+      def pad_last(x:Tensor) -> Tensor:
+        tail = x[-1:].expand((padded_size-size,)+x.shape[1:])
+        return x.cat(tail, dim=0)
+      tree = _tree_map(pad_last, tree)
+
+    blocked = _tree_map(lambda x: x.reshape((blocks, block)+x.shape[1:]), tree)
+    local = fused_hillis_steele(blocked, block, 1)
+    totals = _tree_map(lambda x: x[:, -1], local)
+    block_prefixes = recursive_scan(totals, blocks)
+
+    offsets = _tree_map(lambda x: x[:-1].unsqueeze(1).expand((blocks-1, block)+x.shape[1:]), block_prefixes)
+    fixed = checked_combine(offsets, _tree_map(lambda x: x[1:], local))
+    local = _tree_map(lambda x,y: x[:1].cat(y, dim=0), local, fixed)
+    return _tree_map(lambda x: x.reshape((padded_size,)+x.shape[2:])[:size], local)
+
+  out = _tree_map(move_front, elems)
+  if reverse: out = _tree_map(lambda x: x.flip(0), out)
+  out = recursive_scan(out, n)
+  if reverse: out = _tree_map(lambda x: x.flip(0), out)
+  return _tree_map(move_back, out, elems)
