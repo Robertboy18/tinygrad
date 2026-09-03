@@ -2,7 +2,7 @@ name: Targeted scan validation
 
 on:
   push:
-    branches: [bounty-3039-targeted-ci]
+    branches: [bounty-3039-fuse2-ci]
 
 jobs:
   scan:
