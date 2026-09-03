@@ -2,7 +2,7 @@ name: Targeted scan validation
 
 on:
   push:
-    branches: [bounty-3039-targeted-ci]
+    branches: [bounty-3039-blocked-ci]
 
 jobs:
   scan:
@@ -60,10 +60,10 @@ jobs:
               stride *= 2
             return out_b
 
-          def brent_kung():
+          def blocked():
             return associative_scan(compose, (a, b), axis=2)[1]
 
-          for name, fn in (("serial", serial), ("hillis_steele", hillis_steele), ("brent_kung", brent_kung)):
+          for name, fn in (("serial", serial), ("hillis_steele", hillis_steele), ("blocked", blocked)):
             GlobalCounters.reset()
             start = time.perf_counter()
             out = fn().realize()
