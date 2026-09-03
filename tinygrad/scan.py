@@ -65,12 +65,19 @@ def associative_scan(combine_fn:Callable[[Any, Any], Any], elems:Any, axis:int=0
     return mask.where(value, x)
 
   out = _tree_map(lambda x: x.flip(x._resolve_dim(axis)) if reverse else x, elems)
+  stages = 0
+
+  def checkpoint(tree:Any) -> Any:
+    nonlocal stages
+    stages += 1
+    return _tree_map(lambda x: x.contiguous(), tree) if stages % 2 == 0 else tree
+
   stride = 1
   while stride < n:
     if 2*stride-1 < n:
       left = _tree_map(lambda x: scan_slice(x, stride-1, n-stride, 2*stride), out)
       right = _tree_map(lambda x: scan_slice(x, 2*stride-1, n, 2*stride), out)
-      out = _tree_map(lambda x,y: update(x, y, 2*stride-1, n, 2*stride), out, combine_fn(left, right))
+      out = checkpoint(_tree_map(lambda x,y: update(x, y, 2*stride-1, n, 2*stride), out, combine_fn(left, right)))
     stride *= 2
 
   stride //= 4
@@ -78,7 +85,7 @@ def associative_scan(combine_fn:Callable[[Any, Any], Any], elems:Any, axis:int=0
     if 3*stride-1 < n:
       left = _tree_map(lambda x: scan_slice(x, 2*stride-1, n-stride, 2*stride), out)
       right = _tree_map(lambda x: scan_slice(x, 3*stride-1, n, 2*stride), out)
-      out = _tree_map(lambda x,y: update(x, y, 3*stride-1, n, 2*stride), out, combine_fn(left, right))
+      out = checkpoint(_tree_map(lambda x,y: update(x, y, 3*stride-1, n, 2*stride), out, combine_fn(left, right)))
     stride //= 2
 
   return _tree_map(lambda x: x.flip(x._resolve_dim(axis)) if reverse else x, out)
